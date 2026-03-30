@@ -53,23 +53,24 @@ def process_master_file(uploaded_file):
         mach = exclude_totals(mach, 'City')
         mach = exclude_totals(mach, 'Product')
 
-        # 4. Merge (Using 'outer' to ensure we don't lose machines with 0 sales/stock)
+        # 4. Merge (Starting with Machine Placement to ensure 711+ count)
         df = pd.merge(mach, sales, on=['City', 'Product'], how='left')
         df = pd.merge(df, soh, on=['City', 'Product'], how='left')
         
-        # Numeric cleanup - Fill NaNs with 0 for calculations
+        # Numeric cleanup
         for c in ['Sales_Qty', 'Total_SOH', 'Machine_Count']:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
         # 5. Performance Metrics
-        df['drr'] = df['Sales_Qty'] / 30  
+        df['drr'] = df['Sales_Qty'] / 30  # Daily Run Rate for the SKU-City
+        
+        # DAILY VELOCITY: (Sales / Machines) / 30 days
+        df['velocity'] = np.where(df['Machine_Count'] > 0, (df['Sales_Qty'] / df['Machine_Count']) / 30, 0)
+        
         df['str_pct'] = np.where((df['Sales_Qty'] + df['Total_SOH']) > 0, 
                                  (df['Sales_Qty'] / (df['Sales_Qty'] + df['Total_SOH']) * 100), 0)
         
-        # Velocity calculation: Sales / Machines (Safe against 0 machines)
-        df['velocity'] = np.where(df['Machine_Count'] > 0, df['Sales_Qty'] / df['Machine_Count'], 0)
-        
-        # Days of Cover (Safe against 0 Sales/DRR)
+        # Days of Cover (Safe against 0 DRR)
         df['days_of_cover'] = np.where(df['drr'] > 0, df['Total_SOH'] / df['drr'], 999)
 
         # 6. Movement Bucketing
@@ -80,7 +81,7 @@ def process_master_file(uploaded_file):
         ]
         df['movement_bucket'] = np.select(c_list, ['Fast Mover', 'Slow Mover', 'Liquidate'], default='Steady')
         
-        # 7. ABC Ranking
+        # 7. ABC Ranking (Based on Daily Velocity)
         df['rank'] = df['velocity'].rank(pct=True)
         df['abc_class'] = np.where(df['rank'] > 0.8, 'A', np.where(df['rank'] > 0.5, 'B', 'C'))
         
@@ -145,23 +146,22 @@ with t1:
                     m1, m2, m3, m4 = st.columns(4)
                     
                     total_sales = filtered_df['Sales_Qty'].sum()
-                    # Avg velocity only on machines that actually sold something to keep the metric useful
+                    
+                    # Avg velocity (Daily Units per Machine)
                     active_sales_df = filtered_df[filtered_df['Sales_Qty'] > 0]
-                    avg_velocity = active_sales_df['velocity'].mean() if not active_sales_df.empty else 0
+                    avg_daily_vel = active_sales_df['velocity'].mean() if not active_sales_df.empty else 0
                     
                     top_city = filtered_df.groupby('City')['Sales_Qty'].sum().idxmax()
-                    
-                    # TOTAL MACHINE COUNT (Including 0 sales/stock)
                     total_machines = filtered_df['Machine_Count'].sum()
                     
-                    m1.metric("Total Sales", f"{total_sales:,.0f}")
-                    m2.metric("Avg Velocity (Active)", f"{avg_velocity:.1f}")
+                    m1.metric("Total Sales (Month)", f"{total_sales:,.0f}")
+                    m2.metric("Avg Daily Velocity", f"{avg_daily_vel:.2f}") # 2 decimals better for daily
                     m3.metric("Top City", top_city)
                     m4.metric("Total Machine Count", f"{total_machines:,.0f}")
 
-                    # Formatting
+                    # Formatting for Tables
                     format_map = {
-                        'drr': '{:.1f}', 'str_pct': '{:.1f}%', 'velocity': '{:.1f}',
+                        'drr': '{:.1f}', 'str_pct': '{:.1f}%', 'velocity': '{:.2f}',
                         'days_of_cover': '{:.1f}', 'Sales_Qty': '{:,.0f}',
                         'Total_SOH': '{:,.0f}', 'Machine_Count': '{:,.0f}'
                     }
@@ -171,9 +171,11 @@ with t1:
                     inv_cols = ['City', 'Product', 'Total_SOH', 'drr', 'str_pct', 'days_of_cover', 'movement_bucket']
                     st.dataframe(filtered_df[inv_cols].style.format(format_map).background_gradient(subset=['str_pct'], cmap='RdYlGn'), use_container_width=True)
 
-                    # --- MACHINE (Now includes ALL machines including 0 sales) ---
+                    # --- MACHINE ---
                     st.markdown("### 🤖 Machine Level Performance")
+                    st.caption("Showing performance per machine per day.")
                     mach_cols = ['City', 'Product', 'Sales_Qty', 'Machine_Count', 'velocity', 'abc_class']
+                    # Renaming velocity column internally for display clarity if desired, or just use caption
                     st.dataframe(filtered_df[mach_cols].style.format(format_map).background_gradient(subset=['velocity'], cmap='YlGn'), use_container_width=True)
                 
                 st.markdown("---")
@@ -181,4 +183,4 @@ with t1:
                     results.to_sql('vending_performance', engine, if_exists='append', index=False)
                     st.success("Successfully saved to history.")
 
-# (Rest of the tabs remain the same...)
+# (Rest of tabs: Customer Master, Trend Analysis, Admin remain standard)
