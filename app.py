@@ -8,21 +8,20 @@ import datetime
 # --- APP CONFIG ---
 st.set_page_config(page_title="Vending Performance Hub", layout="wide")
 
-# --- DB CONNECTION ---
-st.sidebar.header("Connection Settings")
-DB_URL = st.sidebar.text_input("Neon DB URL", type="password")
-
+# --- DB CONNECTION (AUTOMATED VIA SECRETS) ---
 def get_engine():
-    if not DB_URL:
+    try:
+        # Pulls from .streamlit/secrets.toml or Cloud Secrets
+        url = st.secrets["DB_URL"]
+        return create_engine(url)
+    except Exception:
+        st.error("Database Secret 'DB_URL' not found. Check your secrets.toml.")
         return None
-    return create_engine(DB_URL)
 
 # --- DATA PROCESSING ENGINE ---
 def process_master_file(uploaded_file):
     try:
-        # Load all sheets
         all_sheets = pd.read_excel(uploaded_file, sheet_name=None)
-        # Case-insensitive sheet mapping
         s_map = {k.lower().strip(): k for k in all_sheets.keys()}
         
         req = ['sales summary', 'soh', 'machine placement']
@@ -30,35 +29,28 @@ def process_master_file(uploaded_file):
             st.error(f"Excel must contain sheets: {req}")
             return None
 
-        # 1. Clean Sales
         sales = all_sheets[s_map['sales summary']].iloc[1:, 0:3].copy()
         sales.columns = ['City', 'Product', 'Sales_Qty']
         
-        # 2. Clean SOH
         soh_raw = all_sheets[s_map['soh']].iloc[1:, [0, 1, 4]].copy()
         soh_raw.columns = ['Loc', 'Product', 'Total_SOH']
         soh_raw['City'] = soh_raw['Loc'].astype(str).str.split(' ').str[0]
         soh = soh_raw.groupby(['City', 'Product'])['Total_SOH'].sum().reset_index()
 
-        # 3. Clean Machines
         mach = all_sheets[s_map['machine placement']].iloc[1:, 0:3].copy()
         mach.columns = ['City', 'Product', 'Machine_Count']
 
-        # 4. Merge & Finalize
         df = pd.merge(sales, soh, on=['City', 'Product'], how='outer')
         df = pd.merge(df, mach, on=['City', 'Product'], how='left')
         
-        # Numeric cleanup
         for c in ['Sales_Qty', 'Total_SOH', 'Machine_Count']:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0 if c != 'Machine_Count' else 1)
         df['Machine_Count'] = df['Machine_Count'].replace(0, 1)
 
-        # Metrics
         df['str_pct'] = (df['Sales_Qty'] / (df['Sales_Qty'] + df['Total_SOH']) * 100).fillna(0)
         df['velocity'] = df['Sales_Qty'] / df['Machine_Count']
         df['days_of_cover'] = np.where(df['Sales_Qty'] > 0, df['Total_SOH'] / (df['Sales_Qty'] / 30), 999)
 
-        # Buckets
         c_list = [
             (df['str_pct'] > 40) & (df['days_of_cover'] < 10),
             (df['days_of_cover'] > 45),
@@ -66,7 +58,6 @@ def process_master_file(uploaded_file):
         ]
         df['movement_bucket'] = np.select(c_list, ['Fast Mover', 'Slow Mover', 'Liquidate'], default='Steady')
         
-        # ABC Class
         df['rank'] = df['velocity'].rank(pct=True)
         df['abc_class'] = np.where(df['rank'] > 0.8, 'A', np.where(df['rank'] > 0.5, 'B', 'C'))
         
@@ -75,10 +66,10 @@ def process_master_file(uploaded_file):
         st.error(f"Processing Error: {e}")
         return None
 
-# --- TABS ---
+# --- UI TABS ---
 t1, t2, t3, t4 = st.tabs(["📊 Monthly Upload", "👤 Customer Master", "📈 Trend Analysis", "🛠 Admin & History"])
 
-# --- TAB 2: CUSTOMER MASTER (Defined first for logic flow) ---
+# --- TAB 2: CUSTOMER MASTER ---
 with t2:
     st.header("Register New Customer")
     with st.form("add_cust", clear_on_submit=True):
@@ -98,7 +89,7 @@ with t2:
     if engine:
         try:
             cust_df = pd.read_sql("SELECT * FROM dim_customers", engine)
-            st.table(cust_df)
+            st.dataframe(cust_df, use_container_width=True)
         except: st.info("No customers registered yet.")
 
 # --- TAB 1: MONTHLY UPLOAD ---
@@ -106,7 +97,6 @@ with t1:
     st.header("Channel Performance Upload")
     engine = get_engine()
     
-    # Dynamic Dropdown
     customer_options = []
     if engine:
         try:
@@ -129,7 +119,13 @@ with t1:
                 results['month'] = pd.to_datetime(target_month)
                 
                 st.write(f"### Preview: {target_cust} - {target_month.strftime('%B %Y')}")
-                st.dataframe(results.style.background_gradient(subset=['velocity', 'str_pct'], cmap='RdYlGn'))
+                
+                # Safe Styling: Checks for matplotlib before applying gradient
+                try:
+                    st.dataframe(results.style.background_gradient(subset=['velocity', 'str_pct'], cmap='RdYlGn'))
+                except ImportError:
+                    st.dataframe(results)
+                    st.info("Tip: Install 'matplotlib' to see color-coded performance gradients.")
                 
                 if st.button("Confirm & Save to History"):
                     results.to_sql('vending_performance', engine, if_exists='append', index=False)
@@ -150,14 +146,15 @@ with t3:
                 fig = px.line(plot_df, x='month', y='velocity', color='product', markers=True, title=f"Machine Velocity Trend - {city_sel}")
                 st.plotly_chart(fig, use_container_width=True)
             else: st.info("No historical data found.")
-        except: st.error("Database connection issues or empty history.")
+        except: st.info("Upload data to see trends.")
 
 # --- TAB 4: ADMIN ---
 with t4:
     st.header("History Management")
     engine = get_engine()
     if engine:
-        if st.button("Purge All Sales History", type="primary"):
+        col_purge, col_export = st.columns(2)
+        if col_purge.button("Purge All Sales History", type="primary"):
             with engine.connect() as conn:
                 conn.execute(text("DELETE FROM vending_performance"))
                 conn.commit()
@@ -165,6 +162,6 @@ with t4:
         
         try:
             full = pd.read_sql("SELECT * FROM vending_performance", engine)
-            st.download_button("Export History to CSV", full.to_csv(index=False), "vending_history.csv")
+            col_export.download_button("Export History to CSV", full.to_csv(index=False), "vending_history.csv")
             st.dataframe(full)
         except: st.write("No records.")
