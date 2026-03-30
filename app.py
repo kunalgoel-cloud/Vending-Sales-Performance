@@ -24,7 +24,7 @@ def process_single_workbook(uploaded_file):
         # Load all sheets into a dictionary
         all_sheets = pd.read_excel(uploaded_file, sheet_name=None)
         
-        # Identify sheets (case-insensitive search)
+        # Standardize sheet names for lookups
         sheet_keys = {k.lower().strip(): k for k in all_sheets.keys()}
         
         sales_df = all_sheets.get(sheet_keys.get('sales summary'))
@@ -32,10 +32,10 @@ def process_single_workbook(uploaded_file):
         mach_df = all_sheets.get(sheet_keys.get('machine placement'))
 
         if sales_df is None or soh_df is None or mach_df is None:
-            st.error("Missing required sheets! Ensure your file has: 'Sales Summary', 'SOH', and 'Machine Placement'")
+            st.error("Missing required sheets! Ensure your Excel has: 'Sales Summary', 'SOH', and 'Machine Placement'")
             return None
 
-        # 1. Clean Sales Summary
+        # 1. Clean Sales Summary (Starting from Row 2 based on your file structure)
         sales = sales_df.iloc[1:, 0:3].copy()
         sales.columns = ['City', 'Product', 'Sales_Qty']
         sales['Sales_Qty'] = pd.to_numeric(sales['Sales_Qty'], errors='coerce').fillna(0)
@@ -44,6 +44,7 @@ def process_single_workbook(uploaded_file):
         soh = soh_df.iloc[1:, [0, 1, 4]].copy()
         soh.columns = ['Location', 'Product', 'Total_SOH']
         soh['Total_SOH'] = pd.to_numeric(soh['Total_SOH'], errors='coerce').fillna(0)
+        # Handle location strings to get City
         soh['City'] = soh['Location'].astype(str).str.split(' ').str[0]
         soh_agg = soh.groupby(['City', 'Product'])['Total_SOH'].sum().reset_index()
 
@@ -64,12 +65,13 @@ def process_single_workbook(uploaded_file):
         return None
 
 def calculate_metrics(df, days_in_month=30):
+    # Calculations
     df['STR_%'] = (df['Sales_Qty'] / (df['Sales_Qty'] + df['Total_SOH']) * 100).fillna(0)
     df['Velocity'] = df['Sales_Qty'] / df['Machine_Count']
     daily_sales = df['Sales_Qty'] / days_in_month
     df['Days_of_Cover'] = np.where(daily_sales > 0, df['Total_SOH'] / daily_sales, 999)
     
-    # Bucketing
+    # Bucketing Logic
     conditions = [
         (df['STR_%'] > 40) & (df['Days_of_Cover'] < 10),
         (df['Days_of_Cover'] > 45),
@@ -78,7 +80,7 @@ def calculate_metrics(df, days_in_month=30):
     choices = ['Fast Mover', 'Slow Mover', 'Liquidate']
     df['Movement_Bucket'] = np.select(conditions, choices, default='Steady')
     
-    # ABC Class
+    # ABC Class (Relative to the current data upload)
     df['Rank'] = df['Velocity'].rank(pct=True)
     df['ABC_Class'] = np.where(df['Rank'] > 0.8, 'A', np.where(df['Rank'] > 0.5, 'B', 'C'))
     
@@ -87,9 +89,16 @@ def calculate_metrics(df, days_in_month=30):
 # --- UI TABS ---
 tab1, tab2, tab3, tab4 = st.tabs(["Monthly Upload", "Customers", "Trends", "Admin"])
 
+# --- TAB 1: UPLOAD ---
 with tab1:
-    st.header("Upload Monthly Workbook")
-    uploaded_file = st.file_uploader("Upload Mama Nourish Master Excel", type=["xlsx"])
+    st.header("Upload Monthly Performance")
+    
+    # NEW: Customer Selection
+    # In a real app, this list could be fetched from the 'Customers' tab/DB
+    customer_list = ["Mama Nourish", "Customer B", "Customer C", "Add New..."]
+    selected_customer = st.selectbox("Select Customer for this Upload", customer_list)
+    
+    uploaded_file = st.file_uploader(f"Upload Master Excel for {selected_customer}", type=["xlsx"])
     report_month = st.date_input("Reporting Month", datetime.date.today().replace(day=1))
 
     if uploaded_file:
@@ -97,46 +106,55 @@ with tab1:
         if data is not None:
             final_df = calculate_metrics(data)
             final_df['Month'] = pd.to_datetime(report_month)
+            final_df['Customer'] = selected_customer # Tagging data with selected customer
             
-            st.subheader(f"Analysis for {report_month.strftime('%B %Y')}")
+            st.subheader(f"Analysis: {selected_customer} - {report_month.strftime('%B %Y')}")
             st.dataframe(final_df.drop(columns=['Rank']).style.background_gradient(subset=['STR_%', 'Velocity'], cmap='RdYlGn'))
             
-            if st.button("Archive to Neon DB"):
+            if st.button("Save & Archive to Neon DB"):
                 engine = get_engine(DB_URL)
                 if engine:
                     final_df.to_sql('vending_performance', engine, if_exists='append', index=False)
-                    st.success("Archived successfully.")
+                    st.success(f"Archived data for {selected_customer} successfully.")
                 else:
-                    st.error("Please provide DB URL in sidebar.")
+                    st.error("Missing Database URL in sidebar.")
 
+# --- TAB 2: CUSTOMERS ---
+with tab2:
+    st.header("Customer Management")
+    st.write("Current customers registered in the system.")
+    # Placeholder for customer directory
+    st.info("This tab will eventually pull from a 'dim_customers' table in your Neon DB.")
+
+# --- TAB 3: TRENDS ---
 with tab3:
-    st.header("Historical Trend Lines")
+    st.header("Trend Analysis")
     engine = get_engine(DB_URL)
     if engine:
         try:
             history = pd.read_sql("SELECT * FROM vending_performance ORDER BY \"Month\" ASC", engine)
             history['Month'] = pd.to_datetime(history['Month'])
             
-            city = st.selectbox("Select Region/City", history['City'].unique())
-            city_data = history[history['City'] == city]
+            # Filter by Customer first
+            hist_customer = st.selectbox("Select Customer to View", history['Customer'].unique())
             
-            fig = px.line(city_data, x='Month', y='Velocity', color='Product', markers=True, 
-                          title=f"SKU Velocity Trend in {city}")
+            cust_data = history[history['Customer'] == hist_customer]
+            city = st.selectbox("Select City", cust_data['City'].unique())
+            
+            plot_df = cust_data[cust_data['City'] == city]
+            
+            fig = px.line(plot_df, x='Month', y='Velocity', color='Product', markers=True, 
+                          title=f"SKU Velocity Trend: {hist_customer} ({city})")
             st.plotly_chart(fig, use_container_width=True)
         except:
-            st.info("No data in DB yet.")
+            st.info("No data available in history yet.")
 
+# --- TAB 4: ADMIN ---
 with tab4:
-    st.header("Maintenance")
-    if st.button("Download Data Backup"):
-        engine = get_engine(DB_URL)
-        if engine:
-            df = pd.read_sql("SELECT * FROM vending_performance", engine)
-            st.download_button("Download CSV", df.to_csv(index=False), "backup.csv")
-    
-    if st.button("Clear History", type="primary"):
+    st.header("Data Maintenance")
+    if st.button("Delete All Data"):
         engine = get_engine(DB_URL)
         if engine:
             with engine.connect() as conn:
                 conn.execute("DROP TABLE IF EXISTS vending_performance")
-                st.success("History cleared.")
+                st.warning("Database has been wiped.")
