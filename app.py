@@ -62,7 +62,7 @@ def process_master_file(uploaded_file):
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0 if c != 'Machine_Count' else 1)
         df['Machine_Count'] = df['Machine_Count'].replace(0, 1)
 
-        # Exclude 0-stock locations
+        # Exclude 0-stock locations to avoid skewing metrics
         df = df[df['Total_SOH'] > 0]
 
         # 5. Performance Metrics
@@ -139,7 +139,6 @@ with t1:
                 st.subheader("🔍 Analysis Filters")
                 f_col1, f_col2 = st.columns(2)
                 
-                # Dynamic Filters
                 city_list = sorted(results['City'].unique())
                 prod_list = sorted(results['Product'].unique())
                 
@@ -163,10 +162,13 @@ with t1:
                     avg_velocity = filtered_df['velocity'].mean()
                     top_city = filtered_df.groupby('City')['Sales_Qty'].sum().idxmax()
                     
+                    # NEW: Calculating unique machine count based on city/product combinations in filter
+                    total_machines = filtered_df['Machine_Count'].sum()
+                    
                     m1.metric("Total Sales", f"{total_sales:,.0f}")
                     m2.metric("Avg Velocity", f"{avg_velocity:.1f}")
                     m3.metric("Top City", top_city)
-                    m4.metric("Active SKUs", len(filtered_df))
+                    m4.metric("Total Machines", f"{total_machines:,.0f}")
 
                     # Formatting
                     format_map = {
@@ -175,20 +177,18 @@ with t1:
                         'Total_SOH': '{:,.0f}', 'Machine_Count': '{:,.0f}'
                     }
 
-                    # --- SPLIT VIEW: INVENTORY ---
+                    # --- INVENTORY ---
                     st.markdown("### 📦 Inventory Level Analysis")
                     inv_cols = ['City', 'Product', 'Total_SOH', 'drr', 'str_pct', 'days_of_cover', 'movement_bucket']
                     st.dataframe(filtered_df[inv_cols].style.format(format_map).background_gradient(subset=['str_pct'], cmap='RdYlGn'), use_container_width=True)
 
-                    # --- SPLIT VIEW: MACHINE ---
+                    # --- MACHINE ---
                     st.markdown("### 🤖 Machine Level Performance")
-                    # Filter out zero sales for machine view
                     mach_view = filtered_df[filtered_df['Sales_Qty'] > 0][['City', 'Product', 'Sales_Qty', 'Machine_Count', 'velocity', 'abc_class']]
                     st.dataframe(mach_view.style.format(format_map).background_gradient(subset=['velocity'], cmap='YlGn'), use_container_width=True)
                 
                 st.markdown("---")
                 if st.button("Archive Full Upload to History"):
-                    # Note: We archive the 'results' (full upload) to ensure complete history
                     results.to_sql('vending_performance', engine, if_exists='append', index=False)
                     st.success("Successfully saved to history.")
 
@@ -203,15 +203,11 @@ with t3:
                 c_sel = st.selectbox("Customer", hist['customer'].unique())
                 cust_hist = hist[hist['customer'] == c_sel]
                 
-                # Filters for Trends
                 t_col1, t_col2 = st.columns(2)
                 t_cities = t_col1.multiselect("Cities", cust_hist['city'].unique(), default=cust_hist['city'].unique()[0])
                 t_prods = t_col2.multiselect("Products", cust_hist['product'].unique(), default=cust_hist['product'].unique()[:3])
                 
-                plot_data = cust_hist[
-                    (cust_hist['city'].isin(t_cities)) & 
-                    (cust_hist['product'].isin(t_prods))
-                ]
+                plot_data = cust_hist[(cust_hist['city'].isin(t_cities)) & (cust_hist['product'].isin(t_prods))]
                 
                 if not plot_data.empty:
                     fig = px.line(plot_data, x='month', y='velocity', color='product', facet_col='city', markers=True)
