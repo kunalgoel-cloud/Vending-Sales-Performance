@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
 from sqlalchemy import create_engine, text
 import datetime
 
@@ -14,12 +13,10 @@ def get_engine():
         url = st.secrets["DB_URL"]
         return create_engine(url)
     except Exception:
-        st.error("Database Secret 'DB_URL' not found.")
         return None
 
 # --- HELPER: DATA CLEANING ---
 def exclude_totals(df, column_name):
-    """Removes rows where the specified column contains 'total' (case-insensitive)"""
     return df[~df[column_name].astype(str).str.lower().str.contains('total', na=False)]
 
 # --- CORE PROCESSING ENGINE ---
@@ -33,55 +30,33 @@ def process_master_file(uploaded_file):
             st.error(f"Excel must contain sheets: {req}")
             return None
 
-        # 1. Clean Sales Summary
-        sales = all_sheets[s_map['sales summary']].iloc[1:, 0:3].copy()
+        # 1. Clean Sheets
+        sales = exclude_totals(all_sheets[s_map['sales summary']].iloc[1:, 0:3], 'City')
         sales.columns = ['City', 'Product', 'Sales_Qty']
-        sales = exclude_totals(sales, 'City')
-        sales = exclude_totals(sales, 'Product')
         
-        # 2. Clean SOH
-        soh_raw = all_sheets[s_map['soh']].iloc[1:, [0, 1, 4]].copy()
+        soh_raw = exclude_totals(all_sheets[s_map['soh']].iloc[1:, [0, 1, 4]], 'Loc')
         soh_raw.columns = ['Loc', 'Product', 'Total_SOH']
-        soh_raw = exclude_totals(soh_raw, 'Loc')
-        soh_raw = exclude_totals(soh_raw, 'Product')
         soh_raw['City'] = soh_raw['Loc'].astype(str).str.split(' ').str[0]
         soh = soh_raw.groupby(['City', 'Product'])['Total_SOH'].sum().reset_index()
 
-        # 3. Clean Machine Placement
-        mach = all_sheets[s_map['machine placement']].iloc[1:, 0:3].copy()
+        mach = exclude_totals(all_sheets[s_map['machine placement']].iloc[1:, 0:3], 'City')
         mach.columns = ['City', 'Product', 'Machine_Count']
-        mach = exclude_totals(mach, 'City')
-        mach = exclude_totals(mach, 'Product')
 
-        # 4. Merge (Starting with Machine Placement to ensure 711+ count)
+        # 2. Merge
         df = pd.merge(mach, sales, on=['City', 'Product'], how='left')
         df = pd.merge(df, soh, on=['City', 'Product'], how='left')
         
-        # Numeric cleanup
         for c in ['Sales_Qty', 'Total_SOH', 'Machine_Count']:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
-        # 5. Performance Metrics
-        df['drr'] = df['Sales_Qty'] / 30  # Daily Run Rate for the SKU-City
-        
-        # DAILY VELOCITY: (Sales / Machines) / 30 days
+        # 3. Basic Calculations
+        df['drr'] = df['Sales_Qty'] / 30  
         df['velocity'] = np.where(df['Machine_Count'] > 0, (df['Sales_Qty'] / df['Machine_Count']) / 30, 0)
-        
         df['str_pct'] = np.where((df['Sales_Qty'] + df['Total_SOH']) > 0, 
                                  (df['Sales_Qty'] / (df['Sales_Qty'] + df['Total_SOH']) * 100), 0)
-        
-        # Days of Cover (Safe against 0 DRR)
         df['days_of_cover'] = np.where(df['drr'] > 0, df['Total_SOH'] / df['drr'], 999)
-
-        # 6. Movement Bucketing
-        c_list = [
-            (df['str_pct'] > 40) & (df['days_of_cover'] < 10),
-            (df['days_of_cover'] > 45),
-            (df['Sales_Qty'] == 0) & (df['Total_SOH'] > 0)
-        ]
-        df['movement_bucket'] = np.select(c_list, ['Fast Mover', 'Slow Mover', 'Liquidate'], default='Steady')
         
-        # 7. ABC Ranking (Based on Daily Velocity)
+        # ABC Ranking
         df['rank'] = df['velocity'].rank(pct=True)
         df['abc_class'] = np.where(df['rank'] > 0.8, 'A', np.where(df['rank'] > 0.5, 'B', 'C'))
         
@@ -91,96 +66,86 @@ def process_master_file(uploaded_file):
         return None
 
 # --- UI TABS ---
-t1, t2, t3, t4 = st.tabs(["📊 Monthly Upload", "👤 Customer Master", "📈 Trend Analysis", "🛠 Admin & History"])
+t1, t2, t3, t4 = st.tabs(["📊 Monthly Upload", "👤 Customer Master", "📈 Trend Analysis", "🛠 Admin"])
 
-# --- TAB 1: MONTHLY UPLOAD ---
 with t1:
     st.header("Upload Monthly Performance")
     engine = get_engine()
     
-    customer_options = []
+    # Customer Selection
+    customer_options = ["Vendiman"] # Fallback if DB not connected
     if engine:
         try:
             customer_options = pd.read_sql("SELECT customer_name FROM dim_customers", engine)['customer_name'].tolist()
         except: pass
 
-    if not customer_options:
-        st.warning("Please add a customer in the 'Customer Master' tab first.")
-    else:
-        col_c, col_m, col_y = st.columns([2, 1, 1])
-        target_cust = col_c.selectbox("Select Customer", customer_options)
-        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        sel_month = col_m.selectbox("Month", months, index=datetime.datetime.now().month - 1)
-        sel_year = col_y.selectbox("Year", range(2024, 2031), index=2) 
-        
-        report_date = datetime.datetime.strptime(f"{sel_month} {sel_year}", "%b %Y").date()
-        file = st.file_uploader("Upload Excel Workbook", type="xlsx")
-        
-        if file:
-            results = process_master_file(file)
-            if results is not None:
-                results['customer'] = target_cust
-                results['month'] = pd.to_datetime(report_date)
+    col_c, col_m, col_y = st.columns([2, 1, 1])
+    target_cust = col_c.selectbox("Select Customer", customer_options)
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    sel_month = col_m.selectbox("Month", months, index=datetime.datetime.now().month - 1)
+    sel_year = col_y.selectbox("Year", range(2024, 2031), index=2) 
+    
+    file = st.file_uploader("Upload Excel Workbook", type="xlsx")
+    
+    if file:
+        results = process_master_file(file)
+        if results is not None:
+            # --- NEW: PRICE INPUT SECTION ---
+            st.markdown("### 💰 Step 2: Item Wise Price Entry")
+            unique_products = sorted(results['Product'].unique())
+            
+            # Create a dictionary to hold user inputs
+            price_map = {}
+            with st.expander("Click to set unit prices for this month", expanded=True):
+                # Use a data editor for a clean table-like input
+                price_df = pd.DataFrame({"Product": unique_products, "Unit_Price_INR": 0.0})
+                edited_price_df = st.data_editor(price_df, use_container_width=True, hide_index=True)
+                
+                # Convert edited dataframe back to a dictionary
+                price_map = dict(zip(edited_price_df['Product'], edited_price_df['Unit_Price_INR']))
+                
+            if st.button("Calculate Financials & Publish Output"):
+                # Apply prices to results
+                results['unit_price'] = results['Product'].map(price_map)
+                results['sales_val'] = results['Sales_Qty'] * results['unit_price']
+                results['soh_val'] = results['Total_SOH'] * results['unit_price']
                 
                 st.markdown("---")
-                st.subheader("🔍 Analysis Filters")
-                f_col1, f_col2 = st.columns(2)
+                # --- SUMMARY METRIC ROW ---
+                st.subheader(f"Results: {target_cust} - {sel_month} {sel_year}")
+                m1, m2, m3, m4 = st.columns(4)
                 
-                city_list = sorted(results['City'].unique())
-                prod_list = sorted(results['Product'].unique())
+                total_sales_units = results['Sales_Qty'].sum()
+                total_sales_val = results['sales_val'].sum()
+                total_soh_units = results['Total_SOH'].sum()
+                total_soh_val = results['soh_val'].sum()
+                total_machines = results['Machine_Count'].sum()
                 
-                selected_cities = f_col1.multiselect("Filter by City", city_list, default=city_list)
-                selected_prods = f_col2.multiselect("Filter by Product", prod_list, default=prod_list)
+                m1.metric("Total Sales (Qty)", f"{total_sales_units:,.0f}")
+                m1.caption(f"Value: **₹{total_sales_val:,.0f}**")
                 
-                # Apply Filters
-                filtered_df = results[
-                    (results['City'].isin(selected_cities)) & 
-                    (results['Product'].isin(selected_prods))
-                ]
-
-                if filtered_df.empty:
-                    st.warning("No data matches the selected filters.")
-                else:
-                    # --- SUMMARY METRIC ROW ---
-                    st.subheader(f"Summary: {target_cust} ({sel_month} {sel_year})")
-                    m1, m2, m3, m4 = st.columns(4)
-                    
-                    total_sales = filtered_df['Sales_Qty'].sum()
-                    
-                    # Avg velocity (Daily Units per Machine)
-                    active_sales_df = filtered_df[filtered_df['Sales_Qty'] > 0]
-                    avg_daily_vel = active_sales_df['velocity'].mean() if not active_sales_df.empty else 0
-                    
-                    top_city = filtered_df.groupby('City')['Sales_Qty'].sum().idxmax()
-                    total_machines = filtered_df['Machine_Count'].sum()
-                    
-                    m1.metric("Total Sales (Month)", f"{total_sales:,.0f}")
-                    m2.metric("Avg Daily Velocity", f"{avg_daily_vel:.2f}") # 2 decimals better for daily
-                    m3.metric("Top City", top_city)
-                    m4.metric("Total Machine Count", f"{total_machines:,.0f}")
-
-                    # Formatting for Tables
-                    format_map = {
-                        'drr': '{:.1f}', 'str_pct': '{:.1f}%', 'velocity': '{:.2f}',
-                        'days_of_cover': '{:.1f}', 'Sales_Qty': '{:,.0f}',
-                        'Total_SOH': '{:,.0f}', 'Machine_Count': '{:,.0f}'
-                    }
-
-                    # --- INVENTORY ---
-                    st.markdown("### 📦 Inventory Level Analysis")
-                    inv_cols = ['City', 'Product', 'Total_SOH', 'drr', 'str_pct', 'days_of_cover', 'movement_bucket']
-                    st.dataframe(filtered_df[inv_cols].style.format(format_map).background_gradient(subset=['str_pct'], cmap='RdYlGn'), use_container_width=True)
-
-                    # --- MACHINE ---
-                    st.markdown("### 🤖 Machine Level Performance")
-                    st.caption("Showing performance per machine per day.")
-                    mach_cols = ['City', 'Product', 'Sales_Qty', 'Machine_Count', 'velocity', 'abc_class']
-                    # Renaming velocity column internally for display clarity if desired, or just use caption
-                    st.dataframe(filtered_df[mach_cols].style.format(format_map).background_gradient(subset=['velocity'], cmap='YlGn'), use_container_width=True)
+                active_sales_df = results[results['Sales_Qty'] > 0]
+                avg_daily_vel = active_sales_df['velocity'].mean() if not active_sales_df.empty else 0
+                m2.metric("Avg Daily Velocity", f"{avg_daily_vel:.2f}")
                 
-                st.markdown("---")
-                if st.button("Archive Full Upload to History"):
-                    results.to_sql('vending_performance', engine, if_exists='append', index=False)
-                    st.success("Successfully saved to history.")
+                m3.metric("Total Stock on Hand", f"{total_soh_units:,.0f}")
+                m3.caption(f"Value: **₹{total_soh_val:,.0f}**")
+                
+                m4.metric("Total Machine Count", f"{total_machines:,.0f}")
 
-# (Rest of tabs: Customer Master, Trend Analysis, Admin remain standard)
+                # --- TABLES ---
+                format_map = {
+                    'drr': '{:.1f}', 'str_pct': '{:.1f}%', 'velocity': '{:.2f}',
+                    'days_of_cover': '{:.1f}', 'Sales_Qty': '{:,.0f}',
+                    'Total_SOH': '{:,.0f}', 'Machine_Count': '{:,.0f}'
+                }
+
+                st.markdown("### 📦 Performance Table")
+                st.dataframe(results[['City', 'Product', 'Sales_Qty', 'Total_SOH', 'Machine_Count', 'velocity', 'abc_class']].style.format(format_map), use_container_width=True)
+
+                if st.button("Confirm & Save to History"):
+                    if engine:
+                        results['month'] = pd.to_datetime(f"1 {sel_month} {sel_year}")
+                        results['customer'] = target_cust
+                        results.to_sql('vending_performance', engine, if_exists='append', index=False)
+                        st.success("Successfully saved!")
