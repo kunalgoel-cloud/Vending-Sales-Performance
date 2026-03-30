@@ -11,19 +11,21 @@ st.set_page_config(page_title="Vending Performance Hub", layout="wide")
 # --- DB CONNECTION ---
 def get_engine():
     try:
-        # Pulls from .streamlit/secrets.toml or Cloud Secrets
         url = st.secrets["DB_URL"]
         return create_engine(url)
     except Exception:
-        st.error("Database Secret 'DB_URL' not found. Please add it to your Streamlit Secrets.")
+        st.error("Database Secret 'DB_URL' not found.")
         return None
+
+# --- HELPER: EXCLUDE TOTAL ROWS ---
+def exclude_totals(df, column_name):
+    """Filters out rows where the specified column contains 'total' (case-insensitive)"""
+    return df[~df[column_name].astype(str).str.lower().str.contains('total', na=False)]
 
 # --- DATA PROCESSING ENGINE ---
 def process_master_file(uploaded_file):
     try:
-        # Load all sheets
         all_sheets = pd.read_excel(uploaded_file, sheet_name=None)
-        # Case-insensitive sheet mapping
         s_map = {k.lower().strip(): k for k in all_sheets.keys()}
         
         req = ['sales summary', 'soh', 'machine placement']
@@ -34,33 +36,39 @@ def process_master_file(uploaded_file):
         # 1. Clean Sales Summary
         sales = all_sheets[s_map['sales summary']].iloc[1:, 0:3].copy()
         sales.columns = ['City', 'Product', 'Sales_Qty']
+        sales = exclude_totals(sales, 'City')
+        sales = exclude_totals(sales, 'Product')
         
-        # 2. Clean SOH (Stock on Hand)
+        # 2. Clean SOH
         soh_raw = all_sheets[s_map['soh']].iloc[1:, [0, 1, 4]].copy()
         soh_raw.columns = ['Loc', 'Product', 'Total_SOH']
-        # Extract City from Location (e.g., "Bangalore Zone 4" -> "Bangalore")
+        soh_raw = exclude_totals(soh_raw, 'Loc')
+        soh_raw = exclude_totals(soh_raw, 'Product')
+        # Extract City
         soh_raw['City'] = soh_raw['Loc'].astype(str).str.split(' ').str[0]
         soh = soh_raw.groupby(['City', 'Product'])['Total_SOH'].sum().reset_index()
 
         # 3. Clean Machine Placement
         mach = all_sheets[s_map['machine placement']].iloc[1:, 0:3].copy()
         mach.columns = ['City', 'Product', 'Machine_Count']
+        mach = exclude_totals(mach, 'City')
+        mach = exclude_totals(mach, 'Product')
 
-        # 4. Merge Data
+        # 4. Merge & Calculate
         df = pd.merge(sales, soh, on=['City', 'Product'], how='outer')
         df = pd.merge(df, mach, on=['City', 'Product'], how='left')
         
-        # Numeric cleanup
+        # Numeric values
         for c in ['Sales_Qty', 'Total_SOH', 'Machine_Count']:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0 if c != 'Machine_Count' else 1)
         df['Machine_Count'] = df['Machine_Count'].replace(0, 1)
 
-        # 5. Calculations (Rounded later in display)
+        # Performance Metrics
         df['str_pct'] = (df['Sales_Qty'] / (df['Sales_Qty'] + df['Total_SOH']) * 100).fillna(0)
         df['velocity'] = df['Sales_Qty'] / df['Machine_Count']
         df['days_of_cover'] = np.where(df['Sales_Qty'] > 0, df['Total_SOH'] / (df['Sales_Qty'] / 30), 999)
 
-        # 6. Movement Bucketing
+        # Movement Buckets
         c_list = [
             (df['str_pct'] > 40) & (df['days_of_cover'] < 10),
             (df['days_of_cover'] > 45),
@@ -68,7 +76,7 @@ def process_master_file(uploaded_file):
         ]
         df['movement_bucket'] = np.select(c_list, ['Fast Mover', 'Slow Mover', 'Liquidate'], default='Steady')
         
-        # 7. ABC Class
+        # ABC Ranking
         df['rank'] = df['velocity'].rank(pct=True)
         df['abc_class'] = np.where(df['rank'] > 0.8, 'A', np.where(df['rank'] > 0.5, 'B', 'C'))
         
@@ -95,20 +103,12 @@ with t2:
                 st.success(f"Registered {name}")
                 st.rerun()
 
-    st.subheader("Active Customer List")
-    engine = get_engine()
-    if engine:
-        try:
-            cust_df = pd.read_sql("SELECT * FROM dim_customers", engine)
-            st.dataframe(cust_df, use_container_width=True)
-        except: st.info("No customers registered yet.")
-
 # --- TAB 1: MONTHLY UPLOAD ---
 with t1:
-    st.header("Channel Performance Upload")
+    st.header("Upload Monthly Data")
     engine = get_engine()
     
-    # Dynamic Dropdown
+    # Load customers for dropdown
     customer_options = []
     if engine:
         try:
@@ -118,18 +118,15 @@ with t1:
     if not customer_options:
         st.warning("Please add a customer in the 'Customer Master' tab first.")
     else:
-        # Date Selection (Month & Year Only)
+        # Date and Customer selection
         col_c, col_m, col_y = st.columns([2, 1, 1])
         target_cust = col_c.selectbox("Select Customer", customer_options)
-        
         months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        current_month = datetime.datetime.now().month
-        sel_month = col_m.selectbox("Month", months, index=current_month - 1)
-        sel_year = col_y.selectbox("Year", range(2024, 2031), index=2) # Defaulting to 2026 for sample data
+        sel_month = col_m.selectbox("Month", months, index=datetime.datetime.now().month - 1)
+        sel_year = col_y.selectbox("Year", range(2024, 2031), index=2) 
         
         report_date = datetime.datetime.strptime(f"{sel_month} {sel_year}", "%b %Y").date()
-        
-        file = st.file_uploader("Upload Master Excel Workbook", type="xlsx")
+        file = st.file_uploader("Upload Excel Workbook", type="xlsx")
         
         if file:
             results = process_master_file(file)
@@ -137,26 +134,23 @@ with t1:
                 results['customer'] = target_cust
                 results['month'] = pd.to_datetime(report_date)
                 
-                st.markdown("---")
-                
                 # --- SUMMARY METRIC ROW ---
-                st.subheader(f"Monthly Summary: {target_cust} ({sel_month} {sel_year})")
+                st.markdown("---")
+                st.subheader(f"Summary: {target_cust} - {sel_month} {sel_year}")
                 m1, m2, m3, m4 = st.columns(4)
                 
+                # Exclude any remaining 'Total' from metrics just in case
                 total_sales = results['Sales_Qty'].sum()
                 avg_velocity = results['velocity'].mean()
-                # Find top city by sales
-                city_sales = results.groupby('City')['Sales_Qty'].sum()
-                top_city = city_sales.idxmax() if not city_sales.empty else "N/A"
-                active_skus = len(results)
+                top_city = results.groupby('City')['Sales_Qty'].sum().idxmax()
                 
-                m1.metric("Total Sales (Units)", f"{total_sales:,.0f}")
-                m2.metric("Avg Velocity", f"{avg_velocity:.1f}") # Rounded to 1 decimal
+                m1.metric("Total Sales", f"{total_sales:,.0f}")
+                m2.metric("Avg Velocity", f"{avg_velocity:.1f}")
                 m3.metric("Top City", top_city)
-                m4.metric("Active SKUs", active_skus)
+                m4.metric("Active SKUs", len(results))
 
-                # Formatting for tables (1 decimal place)
-                format_dict = {
+                # Display Formatting (1 Decimal Place)
+                format_map = {
                     'str_pct': '{:.1f}%',
                     'velocity': '{:.1f}',
                     'days_of_cover': '{:.1f}',
@@ -166,73 +160,41 @@ with t1:
                 }
 
                 # --- SPLIT VIEW: INVENTORY ---
-                st.markdown("### 📦 Inventory Levels")
-                st.caption("Monitoring stock health, Sell-through rate (STR), and days of coverage.")
-                inv_cols = ['City', 'Product', 'Total_SOH', 'str_pct', 'days_of_cover', 'movement_bucket']
-                inv_view = results[inv_cols]
-                
-                try:
-                    st.dataframe(
-                        inv_view.style.format(format_dict, na_rep='-')
-                        .background_gradient(subset=['str_pct'], cmap='RdYlGn'), 
-                        use_container_width=True
-                    )
-                except: 
-                    st.dataframe(inv_view, use_container_width=True)
+                st.markdown("### 📦 Inventory Level Analysis")
+                inv_df = results[['City', 'Product', 'Total_SOH', 'str_pct', 'days_of_cover', 'movement_bucket']]
+                st.dataframe(inv_df.style.format(format_map).background_gradient(subset=['str_pct'], cmap='RdYlGn'), use_container_width=True)
 
                 # --- SPLIT VIEW: MACHINE ---
-                st.markdown("### 🤖 Machine Performance")
-                st.caption("Monitoring sales output per machine and performance classification.")
-                mach_cols = ['City', 'Product', 'Sales_Qty', 'Machine_Count', 'velocity', 'abc_class']
-                mach_view = results[mach_cols]
+                st.markdown("### 🤖 Machine Level Performance")
+                mach_df = results[['City', 'Product', 'Sales_Qty', 'Machine_Count', 'velocity', 'abc_class']]
+                st.dataframe(mach_df.style.format(format_map).background_gradient(subset=['velocity'], cmap='YlGn'), use_container_width=True)
                 
-                try:
-                    st.dataframe(
-                        mach_view.style.format(format_dict, na_rep='-')
-                        .background_gradient(subset=['velocity'], cmap='YlGn'), 
-                        use_container_width=True
-                    )
-                except: 
-                    st.dataframe(mach_view, use_container_width=True)
-                
-                if st.button("Confirm & Save to Neon DB"):
+                if st.button("Archive Data to Neon DB"):
                     results.to_sql('vending_performance', engine, if_exists='append', index=False)
-                    st.success("Data successfully archived to history.")
+                    st.success("Successfully saved to history.")
 
 # --- TAB 3: TREND ANALYSIS ---
 with t3:
-    st.header("Historical Trends")
+    st.header("Performance Trends")
     engine = get_engine()
     if engine:
         try:
             hist = pd.read_sql("SELECT * FROM vending_performance ORDER BY month", engine)
             if not hist.empty:
-                c_sel = st.selectbox("Select Customer to View", hist['customer'].unique(), key="trend_c")
-                cust_hist = hist[hist['customer'] == c_sel]
-                city_sel = st.selectbox("Select City", cust_hist['city'].unique())
-                
-                plot_df = cust_hist[cust_hist['city'] == city_sel]
-                fig = px.line(plot_df, x='month', y='velocity', color='product', markers=True, 
-                              title=f"Machine Velocity Trend: {c_sel} ({city_sel})")
+                c_sel = st.selectbox("Customer", hist['customer'].unique())
+                city_sel = st.selectbox("City", hist[hist['customer']==c_sel]['city'].unique())
+                plot_data = hist[(hist['customer']==c_sel) & (hist['city']==city_sel)]
+                fig = px.line(plot_data, x='month', y='velocity', color='product', markers=True)
                 st.plotly_chart(fig, use_container_width=True)
-            else: st.info("No data available in history. Please upload and save data first.")
-        except: st.write("Awaiting data...")
+        except: st.info("Upload data to see trends.")
 
 # --- TAB 4: ADMIN ---
 with t4:
-    st.header("History Management")
-    engine = get_engine()
-    if engine:
-        col_purge, col_export = st.columns(2)
-        if col_purge.button("Purge All Sales History", type="primary"):
+    st.header("Database Maintenance")
+    if st.button("Clear All History", type="primary"):
+        engine = get_engine()
+        if engine:
             with engine.connect() as conn:
                 conn.execute(text("DELETE FROM vending_performance"))
                 conn.commit()
             st.rerun()
-        
-        try:
-            full = pd.read_sql("SELECT * FROM vending_performance", engine)
-            col_export.download_button("Export History to CSV", full.to_csv(index=False), "vending_history.csv")
-            # Display history with 1 decimal place restriction
-            st.dataframe(full.style.format(precision=1), use_container_width=True)
-        except: st.write("Database is currently empty.")
