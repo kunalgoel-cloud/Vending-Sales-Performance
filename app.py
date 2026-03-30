@@ -11,11 +11,10 @@ st.set_page_config(page_title="Vending Performance Hub", layout="wide")
 # --- DB CONNECTION ---
 def get_engine():
     try:
-        # Pulls from .streamlit/secrets.toml or Cloud Secrets
         url = st.secrets["DB_URL"]
         return create_engine(url)
     except Exception:
-        st.error("Database Secret 'DB_URL' not found. Please ensure it is configured.")
+        st.error("Database Secret 'DB_URL' not found.")
         return None
 
 # --- HELPER: DATA CLEANING ---
@@ -45,7 +44,6 @@ def process_master_file(uploaded_file):
         soh_raw.columns = ['Loc', 'Product', 'Total_SOH']
         soh_raw = exclude_totals(soh_raw, 'Loc')
         soh_raw = exclude_totals(soh_raw, 'Product')
-        # Extract City (e.g., "Mumbai Airport" -> "Mumbai")
         soh_raw['City'] = soh_raw['Loc'].astype(str).str.split(' ').str[0]
         soh = soh_raw.groupby(['City', 'Product'])['Total_SOH'].sum().reset_index()
 
@@ -64,14 +62,14 @@ def process_master_file(uploaded_file):
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0 if c != 'Machine_Count' else 1)
         df['Machine_Count'] = df['Machine_Count'].replace(0, 1)
 
-        # NEW: EXCLUDE 0-STOCK LOCATIONS
-        # This prevents out-of-stock items or unlisted locations from pulling down averages
+        # Exclude 0-stock locations (to avoid skewing averages)
         df = df[df['Total_SOH'] > 0]
 
         # 5. Performance Metrics
+        df['drr'] = df['Sales_Qty'] / 30  # Daily Run Rate
         df['str_pct'] = (df['Sales_Qty'] / (df['Sales_Qty'] + df['Total_SOH']) * 100).fillna(0)
         df['velocity'] = df['Sales_Qty'] / df['Machine_Count']
-        df['days_of_cover'] = np.where(df['Sales_Qty'] > 0, df['Total_SOH'] / (df['Sales_Qty'] / 30), 999)
+        df['days_of_cover'] = np.where(df['Sales_Qty'] > 0, df['Total_SOH'] / df['drr'], 999)
 
         # 6. Movement Bucketing
         c_list = [
@@ -122,7 +120,6 @@ with t1:
     if not customer_options:
         st.warning("Please add a customer in the 'Customer Master' tab first.")
     else:
-        # Date & Customer Selection
         col_c, col_m, col_y = st.columns([2, 1, 1])
         target_cust = col_c.selectbox("Select Customer", customer_options)
         months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -146,15 +143,16 @@ with t1:
                 
                 total_sales = results['Sales_Qty'].sum()
                 avg_velocity = results['velocity'].mean()
-                top_city = results.groupby('City')['Sales_Qty'].sum().idxmax()
+                top_city = results.groupby('City')['Sales_Qty'].sum().idxmax() if not results.empty else "N/A"
                 
-                m1.metric("Total Sales (Units)", f"{total_sales:,.0f}")
+                m1.metric("Total Sales", f"{total_sales:,.0f}")
                 m2.metric("Avg Velocity", f"{avg_velocity:.1f}")
                 m3.metric("Top City", top_city)
                 m4.metric("Active SKUs (In-Stock)", len(results))
 
-                # Display Formatting (1 Decimal Place)
+                # Display Formatting
                 format_map = {
+                    'drr': '{:.1f}',
                     'str_pct': '{:.1f}%',
                     'velocity': '{:.1f}',
                     'days_of_cover': '{:.1f}',
@@ -165,15 +163,18 @@ with t1:
 
                 # --- SPLIT VIEW: INVENTORY ---
                 st.markdown("### 📦 Inventory Level Analysis")
-                st.caption("Active stock performance excluding zero-inventory locations.")
-                inv_df = results[['City', 'Product', 'Total_SOH', 'str_pct', 'days_of_cover', 'movement_bucket']]
-                st.dataframe(inv_df.style.format(format_map).background_gradient(subset=['str_pct'], cmap='RdYlGn'), use_container_width=True)
+                st.caption("Includes Daily Run Rate (DRR) and Stock Coverage.")
+                inv_cols = ['City', 'Product', 'Total_SOH', 'drr', 'str_pct', 'days_of_cover', 'movement_bucket']
+                inv_view = results[inv_cols]
+                st.dataframe(inv_view.style.format(format_map).background_gradient(subset=['str_pct'], cmap='RdYlGn'), use_container_width=True)
 
                 # --- SPLIT VIEW: MACHINE ---
                 st.markdown("### 🤖 Machine Level Performance")
-                st.caption("Sales velocity and classification for stocked machines.")
-                mach_df = results[['City', 'Product', 'Sales_Qty', 'Machine_Count', 'velocity', 'abc_class']]
-                st.dataframe(mach_df.style.format(format_map).background_gradient(subset=['velocity'], cmap='YlGn'), use_container_width=True)
+                st.caption("Active sales performance (Machines with 0 sales excluded).")
+                mach_cols = ['City', 'Product', 'Sales_Qty', 'Machine_Count', 'velocity', 'abc_class']
+                # Filter out zero sales
+                mach_view = results[results['Sales_Qty'] > 0][mach_cols]
+                st.dataframe(mach_view.style.format(format_map).background_gradient(subset=['velocity'], cmap='YlGn'), use_container_width=True)
                 
                 if st.button("Archive Data to Neon DB"):
                     results.to_sql('vending_performance', engine, if_exists='append', index=False)
@@ -190,10 +191,9 @@ with t3:
                 c_sel = st.selectbox("Customer", hist['customer'].unique())
                 city_sel = st.selectbox("City", hist[hist['customer']==c_sel]['city'].unique())
                 plot_data = hist[(hist['customer']==c_sel) & (hist['city']==city_sel)]
-                fig = px.line(plot_data, x='month', y='velocity', color='product', markers=True, title=f"Velocity History: {city_sel}")
+                fig = px.line(plot_data, x='month', y='velocity', color='product', markers=True)
                 st.plotly_chart(fig, use_container_width=True)
-            else: st.info("Upload data to see trends.")
-        except: st.write("Awaiting data...")
+        except: st.info("Upload data to see trends.")
 
 # --- TAB 4: ADMIN ---
 with t4:
