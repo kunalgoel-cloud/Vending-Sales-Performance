@@ -1,16 +1,8 @@
-# Web Framework
 streamlit
-
-# Data Manipulation
 pandas
 numpy
-
-# Visualization
 plotly
-
-# Database Connection (Neon Tech / PostgreSQL)
 sqlalchemy
 psycopg2-binary
-
-# Excel support (if uploading .xlsx files)
 openpyxl
+matplotlib
